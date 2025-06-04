@@ -1,0 +1,493 @@
+// Определяем параметры модели    
+var sourceLocation = ee.Geometry.Point([37.8833, 59.1167]); // Координаты источника выброса (Череповец)
+var region = ee.Geometry.Rectangle([37.5, 58.9, 38.3, 59.3]);
+var U = ee.Number(2); // Скорость ветра
+var zh = ee.Number(50); // Высота источника выброса
+var z = ee.Number(2); // Уровень высоты для расчета концентрации
+// Константы для расчета SygmaY для устойчивочти атмосферы F
+var c = ee.Number(4.1667);
+var d = ee.Number(0.36191);
+
+// Определим временной интервал для данных
+var startDate = '2023-09-01';
+var endDate = '2023-09-07';
+
+// Определяем разрешение
+var Maschtab = 1000; // Примерное значение масштаба в метрах
+
+// Создаем сетку координат вокруг Череповца
+var grid = ee.Image.pixelLonLat().rename(['lon', 'lat']);
+
+// Преобразуем координаты источника в изображение для корректного вычитания
+var sourceLat = ee.Image.constant(sourceLocation.coordinates().get(1));
+
+// Загружаем данные Sentinel-5P
+var sentinel5P = ee.ImageCollection('COPERNICUS/S5P/OFFL/L3_NO2')
+  .filterDate(startDate, endDate) // Пример диапазона дат для получения данных
+  .select('NO2_column_number_density')
+  .filterBounds(region) // фильтр по региону
+  .map(function(image) {
+    var filteredImage = image.where(image.lt(0), 0);
+    // Возможно добавить фильтрацию по качеству данных или другим критериям
+    return image.set('system:time_start', image.get('system:time_start'));
+  });
+
+// Если нужно одно изображение, используйте .first(), если среднее - используйте reduce:
+//var no2Image = sentinel5P.first().rename('no2');
+// Или для среднего по периоду:
+var no2Average = sentinel5P.reduce(ee.Reducer.mean()).rename('no2').clip(region).where(ee.Image(0).lt(0), 0);
+
+// Преобразование моль/м² в моль/м³ 
+var molarMassNO2 = 46.0055; // г/моль - молекулярная масса оксида азота
+var height = 10000;
+
+var no2MGM3 = no2Average
+  .multiply(molarMassNO2 * 1000) // Конвертация моль -> мг и учёт площади
+  .divide(height)                // Учёт высоты для получения объёмной концентрации
+  .rename('satellite_concentration');
+
+// Функция поворота изоображения расчетного поля концентраций
+// по умолчаню изоображение рассчетного поля концентраций формируется
+// для западного направления ветра (угол поворота 0 градусов)
+// чтобы поле концентрации соответствовало текущему направлению ветра
+// его необходимо повернуть на угол angle вокруг центра изоображения origin 
+// image - это поворачиваемое изоображени поля концентраций. opt_proj- проекция не обязательно указывать
+var rotateImage = function(image, origin, angle, opt_proj) {
+  var proj = opt_proj || 'EPSG:3857';
+  
+  proj = ee.Projection(proj);
+  angle = ee.Number(angle);
+
+  var coords = ee.Image.pixelCoordinates(proj);
+  origin = ee.Geometry(origin).transform(proj).coordinates();
+  var coordsRelative = coords.subtract(ee.Image.constant(origin));
+
+  var bands = coords.bandNames();
+  var rotation = ee.Image(ee.Array([ [angle.cos(), angle.sin().multiply(-1)], [angle.sin(), angle.cos()] ]));
+  var coordsRotated = rotation.matrixMultiply(coordsRelative.toArray().arrayRepeat(1, 1)).arrayTranspose().arrayProject([1]).arrayFlatten([bands]);
+  
+  return image.displace(coordsRotated.subtract(coordsRelative));
+};
+
+// Функция для преобразования строки направления в угол в радианах
+function windDirectionToAngle(direction) {
+  // Направления ветра и соответствующие углы в радианах
+  var directions = {
+    'N': Math.PI / 2,          // Север
+    'NE': 3 * Math.PI / 4,     // Северо-восток 
+    'E': Math.PI,              // Восток 
+    'SE': 5 * Math.PI / 4,     // Юго-восток  
+    'S': 3 * Math.PI/ 2,       // Юг
+    'SW': 7 * Math.PI / 4,     // Юго-запад  
+    'W':  0,                   // Запад  
+    'NW': Math.PI / 4,         // Северо-запад  
+  };
+  // Проверка на null или недопустимое направление
+  if (!direction || !directions.hasOwnProperty(direction.toUpperCase())) {
+    print('недопустимое направление ветра');
+    return null; // Возвращаем null для недопустимых направлений
+  }
+  // Возвращаем угол в радианах для указанного направления
+  return ee.Number(directions[direction.toUpperCase()]);
+}
+
+// Вводим направление ветра для цепочки расчетных дней
+var windDirection = 'SW'; // Направление ветра (например, "NW" — северо-запад)
+var angleInRadians = windDirectionToAngle(windDirection);
+
+// Вспомогательная функция для получения SigmaZ
+function getsigmaZ(lonDiff) {
+  // Перевод расстояния из градусов в километры 
+  var earthRadiusKm = 6371; // Средний радиус Земли в километрах
+  var latRadians = ee.Number(59.1167).multiply(Math.PI / 180); // Преобразование широты в радианы
+  var cosLat = ee.Number(Math.cos(latRadians.getInfo())); // Получение косинуса широты
+  var lonDiffKm = lonDiff.multiply(Math.PI / 180).multiply(earthRadiusKm).multiply(cosLat);
+//  lonDiffKm.evaluate(function(value) {
+//  print('lonDiffKm:', value);
+//});
+  var a, b;
+  if (lonDiffKm.lte(0.20)) { a = ee.Number(15.209); b = ee.Number(0.81558); }
+  else if (lonDiffKm.lte(0.70 )) { a = ee.Number(14.457); b = ee.Number(0.78407); }
+  else if (lonDiffKm.lte(1.00 )) { a = ee.Number(13.953); b = ee.Number(0.68465); }
+  else if (lonDiffKm.lte(2.00 )) { a = ee.Number(13.953); b = ee.Number(0.63227); }
+  else if (lonDiffKm.lte(3.00 )) { a = ee.Number(14.823); b = ee.Number(0.54503); }
+  else if (lonDiffKm.lte(7.00 )) { a = ee.Number(16.187); b = ee.Number(0.46490); }
+  else if (lonDiffKm.lte(15.00 )) { a = ee.Number(17.836); b = ee.Number(0.41507); }
+  else if (lonDiffKm.lte(30.00 )) { a = ee.Number(22.651); b = ee.Number(0.32681); }
+  else if (lonDiffKm.lqe(60.00 )) { a = ee.Number(27.074); b = ee.Number(0.27436); }
+  else { a = ee.Number(34.219); b = ee.Number(0.21716); }
+// print('a   b' , a, b, lonDiffKm);
+  var sigmaZ = ee.Image.constant(a).multiply(lonDiffKm.pow(b)); // Использование ee.Image.pow()
+//  print('sigmaZ' , ee.Number(sigmaZ));
+  return sigmaZ;
+}
+
+// Функция для расчета концентрации с изменяющимся Q
+var calculateConcentration = function(Q) {
+  var lonDiff = grid.select('lon').subtract(37.8833).max(0); // max(0)- исключаем из расчета отрицательные координаты, значение концентрации делаем 0
+  if (lonDiff !== null) {
+  var sigmaZ = getsigmaZ(lonDiff);
+} else {
+  print('lonDiff is null');
+}
+// Если вам нужно увидеть значения для всей области, можно вывести статистику
+//lonDiff.reduceRegion({
+//  reducer: ee.Reducer.minMax(),
+//  geometry: sourceLocation.buffer(10000), // или любая другая область интереса
+//  scale: Maschtab
+//}).evaluate(function(stats) {
+//  print('Минимальное и максимальное значение lonDiff:', stats);
+//});
+
+  var earthRadiusKm = 6371; // Средний радиус Земли в километрах
+  var latRadians = ee.Number(59.1167).multiply(Math.PI / 180); // Преобразование широты в радианы
+  var cosLat = ee.Number(Math.cos(latRadians.getInfo())); // Косинус широты
+  var lonDiffKm = lonDiff.multiply(Math.PI / 180).multiply(earthRadiusKm).multiply(cosLat);
+
+// Расчет sigmaY при использовании выражения
+var sigmaY1 = lonDiffKm.expression(
+    '(465.11628 * abs(lon) * tan(0.017453293 * (c - d * log(abs(lon) + 0.00001))))/10', 
+    {
+      'lon': lonDiffKm, // Использование 'lon' как названия диапазона длин
+      'c': c,
+      'd': d
+    }
+);
+
+// print('Debug: sigmaZ', sigmaZ);
+  return grid.expression(
+     'Calc = 1000 * Q / (2 * PI * U * sigmaY1 * sigmaZ) * exp(-(latDiff * latDiff) / (2 * sigmaY1 * sigmaY1)) * ' + 
+    '(exp(-((z - zh) * (z - zh)) / (2 * sigmaZ * sigmaZ)) + exp(-((z + zh) * (z + zh)) / (2 * sigmaZ * sigmaZ)))', 
+    {
+      'Q': Q,
+      'U': U,
+      'zh': zh,
+      'z': z,
+      'latDiff': grid.select('lat').subtract(sourceLat).multiply(1000),
+      'sigmaZ' : sigmaZ,
+      'sigmaY1' : sigmaY1,
+      'PI': Math.PI,
+      'c': c,
+      'd': d
+    }
+  ).rename('concentration').max(0).clip(sourceLocation.buffer(30000)); // назначаем буфер вокруг источника выброса 30 километров
+};
+
+
+// Создаем список значений Q
+var Qvalues = ee.List.sequence(0.001, 0.1, 0.005); 
+
+// Функция для вычисления суммы квадратов разностей
+var sumOfSquareDifferences = function(calculated, observed) {
+  return calculated.subtract(observed).pow(2).reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: sourceLocation.buffer(30000),
+    scale: Maschtab // Используем переменную Maschtab для масштаба
+  }).get('concentration'); // Используем ключ, соответствующий названию полосы
+};
+
+// Проходим по каждому значению Q и сравниваем
+var results = ee.List(Qvalues).map(function(Q) {
+  var Qnum = ee.Number(Q);
+  // считаем концентрации для направления запад
+  var calculatedConcNo = calculateConcentration(Qnum);
+  // поворачиваем расчетное поле концентраций в соответствии с направлением ветра
+  var calculatedConc = rotateImage(calculatedConcNo, sourceLocation, angleInRadians);
+  if (calculatedConc !== null) {
+    var ssd = sumOfSquareDifferences(calculatedConc, no2MGM3);
+    if (ssd !== null) {
+      return ee.Dictionary({
+        'Q': Qnum,
+        'SSD': ee.Number(ssd)
+      });
+    }
+  }
+  return null; // Возвращение null, если какой-либо из шагов завершается неудачно
+}).removeAll([null]);
+
+
+// Преобразуем результаты в таблицу
+var resultsTable = ee.FeatureCollection(results.map(function(dict) {
+  dict = ee.Dictionary(dict);
+  if (dict.size().gt(0)) {
+    return ee.Feature(null, dict);
+  } else {
+    return null;
+  }
+}).filter(ee.Filter.notNull(['Q', 'SSD'])));
+
+// Выводим результаты
+print('Таблица результатов расчетов СКО:', resultsTable);
+// Отображаем лучшую модель на карте
+var bestQ = resultsTable.sort('SSD').first().get('Q');
+var bestSSD = resultsTable.sort('SSD').first().get('SSD');
+var bestModelNo = calculateConcentration(ee.Number(bestQ));
+//------------------------------------поворот изоображения
+// Вызов функции rotateImage
+var bestModel = rotateImage(bestModelNo, sourceLocation, angleInRadians);
+print('Наименьшее СКО: ', bestSSD, 'для модели с Q [кг/с]', bestQ);
+
+// ---------------------------------------
+// Выберем значение Q оптимальное
+var concentrationMap = bestModel;
+
+// Определите точку, в которой хотите получить расчетную концентрацию
+var pointOfInterest = ee.Geometry.Point([37.91, 59.12]); // Пример координаты
+
+// Получение расчетной концентрации в точке
+var concentrationAtPoint = concentrationMap.reduceRegion({
+  reducer: ee.Reducer.first(),
+  geometry: pointOfInterest,
+  scale: Maschtab // Используем переменную Maschtab для масштаба
+}).get('concentration');
+
+// Вывод расчетной концентрации в точке
+print('Расчетная концентрация в точке (мг/м3):', concentrationAtPoint);
+
+// Определите точки, в которой хотите получить концентрацию по данным спутника
+var points = ee.FeatureCollection([
+  ee.Feature(ee.Geometry.Point([37.881841, 59.123391]), {name: "Пост № 1"}),
+  ee.Feature(ee.Geometry.Point([37.924568, 59.140085]), {name: "Пост № 2"}),
+  ee.Feature(ee.Geometry.Point([37.901204, 59.125132]), {name: "Пост № 3"}),
+  ee.Feature(ee.Geometry.Point([37.942247, 59.148046]), {name: "Пост № 4"}),
+  ee.Feature(ee.Geometry.Point([37.960128, 59.118592]), {name: "Пост № 5"}),
+  ee.Feature(ee.Geometry.Point([37.924348, 59.092129]), {name: "Пост № 6"})
+]);
+
+// Функция для извлечения спутниковой концентрации
+var getSatelliteConcentration = function(feature) {
+  var satConc = no2MGM3.reduceRegion({
+    reducer: ee.Reducer.first(),
+    geometry: feature.geometry(),
+    scale: Maschtab
+  }).get('satellite_concentration');
+  
+  return feature.set('satellite_concentration', satConc);
+};
+
+// Применение функции к каждой точке
+var satelliteData = points.map(getSatelliteConcentration);
+
+// Вывод результатов:
+print('Концентрации NO2 в точках по данным Sentinel-5P (мг/м3):');
+satelliteData.evaluate(function(features) {
+  features.features.forEach(function(feature) {
+    print(feature.properties.name + ': ' + feature.properties.satellite_concentration);
+  });
+});
+
+
+// Определите точку, в которой хотите получить концентрацию по данным спутника
+//var pointOfInterest = ee.Geometry.Point([37.91, 59.12]); // Пример координаты
+
+// Получение концентрации no2 в точке из данных Sentinel-5P в мг/м3
+//var no2atPoint = no2MGM3.reduceRegion({
+  //reducer: ee.Reducer.first(),
+  //geometry: pointOfInterest,
+  //scale: Maschtab // Используем переменную Maschtab для масштаба
+//}).get('satellite_concentration');
+
+// Вывод концентрации NO2 в точке
+//print('Концентрация NO2 в точке по данным Sentinel-5P (мг/м3):', no2atPoint);
+
+Map.setCenter(37.8833, 59.1167, 10);
+
+// Функция для получения статистики в регионе
+var getStats = function(image, region, scale) {
+  return image.reduceRegion({
+    reducer: ee.Reducer.minMax(),
+    geometry: region,
+    scale: scale,
+    maxPixels: 1e13
+  });
+};
+
+// Получение статистики для спутниковых данных
+var satelliteStats = getStats(no2MGM3.max(0), region, Maschtab);
+var satMin = ee.Number(satelliteStats.get('satellite_concentration_min')).max(0);
+var satMax = ee.Number(satelliteStats.get('satellite_concentration_max'));
+
+// Получение статистики для модельных данных
+var modelStats = getStats(bestModel.max(0), region, Maschtab);
+var modelMin = ee.Number(modelStats.get('concentration_min')).max(0);
+var modelMax = ee.Number(modelStats.get('concentration_max'));
+
+// Палитра
+var satelliteVisParams = {
+  min: satMin.getInfo(),
+  max: satMax.getInfo(),
+  palette: ['darkblue', 'blue', 'cyan', 'green', 'yellow', 'red']
+};
+
+var modelVisParams = {
+  min: modelMin.getInfo(),
+  max: modelMax.getInfo(),
+  palette: ['darkblue', 'blue', 'cyan', 'green', 'yellow', 'red']
+};
+
+// Функция для создания легенды с цветовыми диапазонами
+var createLegend = function(title, min, max, palette, position) {
+  var legend = ui.Panel({
+    style: {
+      position: position,
+      padding: '8px 15px',
+      backgroundColor: 'white'
+    }
+  });
+
+  legend.add(ui.Label({
+    value: title,
+    style: {fontWeight: 'bold', fontSize: '14px', margin: '0 0 10px 0'}
+  }));
+
+  // Расчет диапазонов
+  var range = max.subtract(min);
+  var step = range.divide(7);
+  var intervals = ee.List.sequence(0, 7).map(function(i) {
+    return min.add(step.multiply(i));
+  });
+
+  // Создание элементов легенды
+  for (var i = 0; i < 6; i++) {
+    var lower = ee.Number(intervals.get(i));
+    var upper = ee.Number(intervals.get(i+1));
+    var color = palette[i];
+
+    var colorBox = ui.Label({
+      style: {
+        backgroundColor: color,
+        padding: '8px',
+        margin: '0 0 4px 0',
+        width: '30px'
+      }
+    });
+
+    var labelText = ee.Number(lower).format('%.5f').getInfo() + ' - ' + 
+                    ee.Number(upper).format('%.5f').getInfo();
+
+    var label = ui.Label({
+      value: labelText,
+      style: {margin: '0 0 4px 6px'}
+    });
+
+    legend.add(ui.Panel([colorBox, label], ui.Panel.Layout.Flow('horizontal')));
+  }
+
+  return legend;
+};
+
+// Создание легенд
+var satelliteLegend = createLegend(
+  'Концентрация NO2 (мг/м³)', 
+  satMin, 
+  satMax, 
+  satelliteVisParams.palette, 
+  'bottom-left'
+);
+
+var modelLegend = createLegend(
+  'Расчетная концентрация (мг/м³)', 
+  modelMin, 
+  modelMax, 
+  modelVisParams.palette, 
+  'bottom-left'
+);
+
+// Добавление слоев и легенд
+Map.addLayer(bestModel, modelVisParams, 'Поле концентрации NO2 для лучшей модели');
+Map.addLayer(no2MGM3, satelliteVisParams, 'Концентрация NO2 по спутниковым данным');
+Map.addLayer(sourceLocation, {color: 'black'}, 'Источник выброса');
+Map.addLayer(pointOfInterest, {color: 'red'}, 'Контрольная точка определения концентрации');
+Map.add(modelLegend);
+Map.add(satelliteLegend);
+
+// Добавление точек на карту
+Map.addLayer(points, {color: 'FF00CC'}, 'Посты наблюдения');
+
+// РАСЧЕТ НЕКАНЦЕРОГЕННОГО РИСКА ЗДОРОВЬЮ
+// Референсная концентрация для NO2
+var RfC = 0.06; // мг/м³
+
+// Расчет HQ
+var HQ = no2MGM3.divide(RfC);
+
+// Классификация уровней риска
+var riskLevels = HQ
+  .where(HQ.gt(3), 4) // Высокий уровень риска (HQ > 3)
+  .where(HQ.gte(1.1).and(HQ.lte(3)), 3) // Настораживающий уровень риска (1.1 <= HQ <= 3)
+  .where(HQ.gte(0.1).and(HQ.lt(1.1)), 2) // Допустимый уровень риска (0.1 <= HQ < 1.1)
+  .where(HQ.lt(0.1), 1); // Минимальный уровень риска (HQ < 0.1)
+
+// Палитра для визуализации уровней риска
+var riskPalette = {
+  min: 1,
+  max: 4,
+  palette: ['green', 'yellow', 'orange', 'red'] // Цвета для уровней риска
+};
+
+// Визуализация карты
+//Map.centerObject(no2GPerM3, 10); // Центрирование карты на изображении
+Map.addLayer(riskLevels, riskPalette, 'Уровни риска');
+
+// Добавление легенды
+var legend = ui.Panel({
+  style: {
+    position: 'bottom-right',
+    padding: '8px 15px'
+  }
+});
+
+var legendTitle = ui.Label({
+  value: 'Уровни риска',
+  style: {
+    fontWeight: 'bold',
+    fontSize: '18px',
+    margin: '0 0 4px 0',
+    padding: '0'
+  }
+});
+
+legend.add(legendTitle);
+
+var levels = [
+  {color: 'green', label: 'Минимальный < 0.000001 (HQ < 0.1)'},
+  {color: 'yellow', label: 'Допустимый 0.000011-0.00011 (0.1 <= HQ < 1.1)'},
+  {color: 'orange', label: 'Настораживающий 0.00011-0.001 (1.1 <= HQ <= 3)'},
+  {color: 'red', label: 'Высокий > 0.001 (HQ > 3)'}
+];
+
+levels.forEach(function(level) {
+  var colorBox = ui.Label({
+    style: {
+      backgroundColor: level.color,
+      padding: '8px',
+      margin: '0 0 4px 0'
+    }
+  });
+
+  var description = ui.Label({
+    value: level.label,
+    style: {margin: '0 0 0 6px'}
+  });
+
+  legend.add(ui.Panel([colorBox, description], ui.Panel.Layout.Flow('horizontal')));
+});
+
+Map.add(legend);
+
+var riskLevelsRenamed = riskLevels.rename('risk_level');
+
+var HQRenamed = HQ.rename('risk');// Экспорт карты риска в GeoTIFF на Google Диск
+Export.image.toDrive({
+  image: HQRenamed.toFloat(), // Конвертация в вещественный тип
+  description: 'ExportHQGeoTIFF', // Описание 
+  fileNamePrefix: 'no2_hq', // Префикс имени файла
+  region: sourceLocation.buffer(30000).bounds(), // Регион экспорта, 30 км
+  scale: Maschtab, // Разрешение
+  crs: 'EPSG:4326', // Система координат 
+  fileFormat: 'GeoTIFF', // Формат
+  maxPixels: 1e13, // Лимит пикселей
+  formatOptions: { 
+    cloudOptimized: true // Оптимизация
+  }
+});

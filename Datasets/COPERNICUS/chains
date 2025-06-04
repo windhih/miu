@@ -1,0 +1,163 @@
+var cherepovetsRectangle = ee.Geometry.Rectangle([
+  [37.50, 60.00], // Northwest corner [longitude, latitude]
+  [38.50, 59.00]  // Southeast corner [longitude, latitude]
+]);
+
+var windCollection = ee.ImageCollection('ECMWF/ERA5_LAND/HOURLY')
+    .select(['u_component_of_wind_10m', 'v_component_of_wind_10m'])
+    .filterDate('2020-04-01', '2020-04-30')
+    .filterBounds(cherepovetsRectangle); // Filter for data within the rectangle
+
+//var point = ee.Geometry.Point([37.90, 59.12]); 
+
+// Функция для расчета скорости и направления ветра
+function calculateWind(image) {
+  var uWind = image.select('u_component_of_wind_10m');
+  var vWind = image.select('v_component_of_wind_10m');
+  var windSpeed = uWind.pow(2).add(vWind.pow(2)).sqrt().rename('wind-speed');
+  var windDirection = uWind.addBands(vWind).expression(
+      'atan2(y, x)', {
+        'x': uWind,
+        'y': vWind
+      }
+  ).multiply(180.0 / Math.PI).add(180).rename('wind-direction');
+  return image.addBands(windSpeed).addBands(windDirection);
+}
+
+// Группировка данных за день
+var windCollectionDaily = windCollection.map(function(image) {
+  var date = image.date().format('yyyy-MM-dd');
+  return image.set('dailyDate', date);
+});
+
+// Агрегация по дате
+var dailyAggregated = ee.ImageCollection.fromImages(
+  ee.List(windCollectionDaily.aggregate_array('dailyDate')).distinct().map(function(date) {
+    var dayImages = windCollectionDaily.filterMetadata('dailyDate', 'equals', date);
+    return dayImages.mean().set('system:time_start', ee.Date(date).millis());
+  })
+);
+
+var windCollectionWithStats = dailyAggregated.map(calculateWind);
+
+var reduceResult = windCollectionWithStats.map(function(image) {
+  var stats = image.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: cherepovetsRectangle, // Use the rectangle instead of a point
+    scale: 10000 // Adjust scale as needed for your dataset's resolution
+  });
+  return image.set(stats);
+});
+
+var timeSeries = windCollectionWithStats.map(function(image) {
+  var stats = image.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: cherepovetsRectangle,
+    scale: 10000
+  });
+  var speed = ee.Number(stats.get('wind-speed'));
+  var direction = ee.Number(stats.get('wind-direction'));
+  var date = image.date().format('yyyy-MM-dd');
+  return ee.Feature(null, {
+    'date': date,
+    'wind-speed': speed,
+    'wind-direction': direction
+  });
+});
+
+//Функция для группировки по направлению ветра
+function groupByDirection(list) {
+  // Инициализация
+  var initialAccumulator = ee.Dictionary({
+    'resultGroups': ee.List([]),
+    'currentGroup': ee.List([]), // Текущая группа
+    'firstDirection': null 
+  });
+
+  // Функция для итерации
+  var iterateFunction = function(feature, accumulator) {
+    var acc = ee.Dictionary(accumulator);
+    var resultGroups = ee.List(acc.get('resultGroups'));
+    var currentGroup = ee.List(acc.get('currentGroup'));
+    var firstDirection = acc.get('firstDirection');
+
+    var direction = ee.Number(ee.Feature(feature).get('wind-direction')); 
+
+    // Проверка: является ли firstDirection null
+    var isFirstDirectionNull = ee.Algorithms.IsEqual(firstDirection, null);
+
+    // Вычисляем разницу между текущим направлением и firstDirection
+    var diff = ee.Number(direction).subtract(ee.Number(firstDirection)).abs();
+
+    // Проверка разницы с firstDirection
+    var isSimilarDirection = diff.lte(45);
+
+    var newCurrentGroup = ee.Algorithms.If(
+      isFirstDirectionNull, 
+      currentGroup.add(feature), 
+      ee.Algorithms.If(
+        isSimilarDirection, 
+        currentGroup.add(feature), 
+        ee.List([feature]) 
+      )
+    );
+
+    var newResultGroups = ee.Algorithms.If(
+      isFirstDirectionNull, 
+      resultGroups, 
+      ee.Algorithms.If(
+        isSimilarDirection, 
+        resultGroups, 
+        resultGroups.add(currentGroup) 
+      )
+    );
+
+    var newFirstDirection = ee.Algorithms.If(
+      isFirstDirectionNull, 
+      direction, 
+      ee.Algorithms.If(
+        isSimilarDirection, 
+        firstDirection, 
+        direction 
+      )
+    );
+
+    return ee.Dictionary({
+      'resultGroups': newResultGroups,
+      'currentGroup': newCurrentGroup,
+      'firstDirection': newFirstDirection
+    });
+  };
+
+  var finalAccumulator = ee.Dictionary(ee.List(list).iterate(iterateFunction, initialAccumulator));
+  var finalResultGroups = ee.List(finalAccumulator.get('resultGroups'));
+  var finalCurrentGroup = ee.List(finalAccumulator.get('currentGroup'));
+
+  return finalResultGroups.cat(
+    ee.Algorithms.If(
+      finalCurrentGroup.size().gt(0),
+      ee.List([finalCurrentGroup]),
+      ee.List([])
+    )
+  );
+}
+
+var groupedDays = groupByDirection(timeSeries.toList(timeSeries.size()));
+print('Grouped days:', groupedDays);
+
+// Легенда
+var firstImage = windCollectionWithStats.first();
+Map.centerObject(firstImage, 3);
+Map.addLayer(firstImage.select('wind-speed'), {min:0, max:20, palette: ['blue', 'white', 'red']}, 'Wind Speed');
+Map.addLayer(firstImage.select('wind-direction'), {min:0, max:360, palette: ['blue', 'green', 'yellow', 'orange', 'red']}, 'Wind Direction');
+var legendPanel2 = ui.Panel({  widgets: [
+    ui.Label({value: 'Направление ветра', style: {fontWeight: 'bold'}}),    ui.Label({value: 'В/E: 0°', style: {margin: '0px 0px 2px 5px'}}),
+    ui.Label({value: 'С-В/NE: 45°', style: {margin: '0px 0px 2px 5px'}}),    ui.Label({value: 'С/N: 90°', style: {margin: '0px 0px 2px 5px'}}),
+    ui.Label({value: 'С-З/NW: 135°', style: {margin: '0px 0px 2px 5px'}}),    ui.Label({value: 'З/W: 180°', style: {margin: '0px 0px 2px 5px'}}),
+    ui.Label({value: 'Ю-З/SW: 225°', style: {margin: '0px 0px 2px 5px'}}),    ui.Label({value: 'Ю/S: 270°', style: {margin: '0px 0px 2px 5px'}}),
+    ui.Label({value: 'Ю-В/SE: 315°', style: {margin: '0px 0px 2px 5px'}}),  ],
+  style: {    position: 'bottom-left',
+    width: '200px',    height: 'auto',
+    padding: '2px',    backgroundColor: 'rgba(255, 255, 255, 0.8)'
+  }});
+Map.add(legendPanel2);

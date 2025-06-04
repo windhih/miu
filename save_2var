@@ -1,0 +1,166 @@
+// 1. Загрузка данных с правильными именами каналов
+// -------------------------------------------------
+var loadRiskLayer = function(assetPath, bandName) {
+  return ee.Image(assetPath)
+    .select([bandName])
+    .rename('risk_class')
+    .unmask(0)
+    .clamp(1, 4);
+};
+
+var so2Risk = loadRiskLayer('users/viktoriar490/so2', 'satellite_concentration');
+var no2Risk = loadRiskLayer('users/viktoriar490/no2', 'satellite_concentration');
+
+// 3. Расчет комбинированного риска
+// -------------------------------------------------
+var totalRisk = ee.ImageCollection([so2Risk, no2Risk])
+  .max()
+  .rename('total_risk_class');
+
+// 4. Визуализация параметры
+// -------------------------------------------------
+var classVisParams = {
+  min: 1,
+  max: 4,
+  palette: ['green', 'yellow', 'orange', 'red'],
+  opacity: 0.7
+};
+
+// 5. Добавление слоев на карту
+// -------------------------------------------------
+Map.centerObject(so2Risk.geometry().bounds(), 9);
+Map.addLayer(so2Risk, classVisParams, 'SO₂ риск');
+Map.addLayer(no2Risk, classVisParams, 'NO₂ риск');
+Map.addLayer(totalRisk, classVisParams, 'Комбинированный риск');
+
+// 6. Экспорт данных
+// -------------------------------------------------
+var exportRegion = ee.Geometry.MultiPolygon([
+  so2Risk.geometry().bounds(),
+  no2Risk.geometry().bounds()
+]).bounds();
+
+Export.image.toDrive({
+  image: totalRisk,
+  description: 'TotalRisk_Export',
+  fileNamePrefix: 'total_air_risk',
+  region: exportRegion,
+  scale: 1000,
+  crs: 'EPSG:4326',
+  fileFormat: 'GeoTIFF',
+  maxPixels: 1e13,
+  formatOptions: {
+    cloudOptimized: true
+  }
+});
+
+// 7. Проверка значений в контрольных точках (ИСПРАВЛЕННЫЙ БЛОК)
+// -------------------------------------------------
+
+var points = ee.FeatureCollection([
+  ee.Feature(ee.Geometry.Point([37.881841, 59.123391]), {name: "Пост № 1"}),
+  ee.Feature(ee.Geometry.Point([37.924568, 59.140085]), {name: "Пост № 2"}),
+  ee.Feature(ee.Geometry.Point([37.901204, 59.125132]), {name: "Пост № 3"}),
+  ee.Feature(ee.Geometry.Point([37.942247, 59.148046]), {name: "Пост № 4"}),
+  ee.Feature(ee.Geometry.Point([37.960128, 59.118592]), {name: "Пост № 5"}),
+  ee.Feature(ee.Geometry.Point([37.924348, 59.092129]), {name: "Пост № 6"})
+]);
+
+
+
+function getRiskStat(feature) {
+  var so2 = so2Risk.reduceRegion({
+    reducer: ee.Reducer.mode(),
+    geometry: feature.geometry(),
+    scale: 1000
+  }).get('risk_class');
+  
+  var no2 = no2Risk.reduceRegion({
+    reducer: ee.Reducer.mode(),
+    geometry: feature.geometry(),
+    scale: 1000
+  }).get('risk_class');
+  
+  var total = totalRisk.reduceRegion({
+    reducer: ee.Reducer.mode(),
+    geometry: feature.geometry(),
+    scale: 1000
+  }).get('total_risk_class');
+  
+  return feature.set({
+    'SO2_risk': so2,
+    'NO2_risk': no2,
+    'Total_risk': total
+  });
+}
+
+var pointsWithStats = points.map(getRiskStat);
+
+// Правильный способ вывода результатов
+print('Проверка в точках:');
+pointsWithStats.evaluate(function(result) {
+  // Получаем массив фич из результата
+  var features = result.features;
+  
+  // Перебираем все точки и выводим их значения
+  features.forEach(function(feature) {
+    var props = feature.properties;
+    print(
+      props.name + 
+      ' (' + feature.geometry.coordinates[0].toFixed(3) +
+      ', ' + feature.geometry.coordinates[1].toFixed(3) + '):',
+      'SO2: ' + props.SO2_risk,
+      'NO2: '+ props.NO2_risk,
+      'СУММАРНЫЙ: ' + props.Total_risk
+    );
+  });
+});
+
+// 8. Легенда (остается без изменений)
+// -------------------------------------------------
+
+// Добавление легенды
+var legend = ui.Panel({
+  style: {
+    position: 'bottom-right',
+    padding: '8px 15px'
+  }
+});
+
+var legendTitle = ui.Label({
+  value: 'Уровни риска',
+  style: {
+    fontWeight: 'bold',
+    fontSize: '18px',
+    margin: '0 0 4px 0',
+    padding: '0'
+  }
+});
+
+legend.add(legendTitle);
+
+var levels = [
+  {color: 'green', label: 'Минимальный < 0.000001 (HQ < 0.1)'},
+  {color: 'yellow', label: 'Допустимый 0.000011-0.00011 (0.1 <= HQ < 1.1)'},
+  {color: 'orange', label: 'Настораживающий 0.00011-0.001 (1.1 <= HQ <= 3)'},
+  {color: 'red', label: 'Высокий > 0.001 (HQ > 3)'}
+];
+
+levels.forEach(function(level) {
+  var colorBox = ui.Label({
+    style: {
+      backgroundColor: level.color,
+      padding: '8px',
+      margin: '0 0 4px 0'
+    }
+  });
+
+  var description = ui.Label({
+    value: level.label,
+    style: {margin: '0 0 0 6px'}
+  });
+
+  legend.add(ui.Panel([colorBox, description], ui.Panel.Layout.Flow('horizontal')));
+});
+
+Map.add(legend);

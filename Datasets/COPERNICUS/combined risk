@@ -1,0 +1,194 @@
+// Загрузка карт рисков из Asset
+var so2Risk = ee.Image('users/viktoriar490/so2_hq')
+  .select(['risk']) // Выбор названия банда
+  .unmask(0)
+  .rename('risk'); // Унифицированное имя
+
+var no2Risk = ee.Image('users/viktoriar490/no2_hq')
+  .select(['risk'])
+  .unmask(0)
+  .rename('risk');
+
+// Оценка суммарного риска
+var totalRisk = so2Risk.multiply(1.0)  // Вес SO₂ = 1 (это на будущее)
+                      .add(no2Risk.multiply(1.0))  // Вес NO₂ = 1  (это на будущее)
+                      .rename('total_risk');  
+  
+
+// Определение региона экспорта
+var region = ee.FeatureCollection([
+  ee.Feature(so2Risk.geometry().bounds()),
+  ee.Feature(no2Risk.geometry().bounds())
+]).geometry().bounds();
+
+// Визуализация
+
+// Классификация уровней риска NO2
+var riskLevelsNO2 = no2Risk
+  .where(no2Risk.gt(3), 4) // Высокий уровень риска (HQ > 3)
+  .where(no2Risk.gte(1.1).and(no2Risk.lte(3)), 3) // Настораживающий уровень риска (1.1 <= HQ <= 3)
+  .where(no2Risk.gte(0.1).and(no2Risk.lt(1.1)), 2) // Допустимый уровень риска (0.1 <= HQ < 1.1)
+  .where(no2Risk.lt(0.1), 1); // Минимальный уровень риска (HQ < 0.1)
+
+
+// Классификация уровней риска SO2
+var riskLevelsSO2 = so2Risk
+  .where(so2Risk.gt(3), 4) // Высокий уровень риска (HQ > 3)
+  .where(so2Risk.gte(1.1).and(so2Risk.lte(3)), 3) // Настораживающий уровень риска (1.1 <= HQ <= 3)
+  .where(so2Risk.gte(0.1).and(so2Risk.lt(1.1)), 2) // Допустимый уровень риска (0.1 <= HQ < 1.1)
+  .where(so2Risk.lt(0.1), 1); // Минимальный уровень риска (HQ < 0.1)
+
+// Разбиваем на классы (интервалы) суммарный риск
+var classified = totalRisk
+  .where(totalRisk.lte(1), 1)          // ≤ 1 → класс 1 (зелёный)
+  .where(totalRisk.gt(1.0).and(totalRisk.lte(3.0)), 2)  // 1–3 → класс 2 (жёлтый)
+  .where(totalRisk.gt(3.0).and(totalRisk.lte(6)), 3)  // 3–6 → класс 3 (оранжевый)
+  .where(totalRisk.gt(6), 4);          // > 6 → класс 4 (красный)
+  
+// Визуализация для суммарного риска
+var visParams = {
+  min: 1,  // минимальный класс
+  max: 4,  // максимальный класс
+  opacity: 0.7,
+  palette: ['green', 'yellow', 'orange', 'red']  // цвета по порядку классов
+};
+
+Map.centerObject(region, 10);
+Map.addLayer(riskLevelsSO2, visParams, 'Риск SO₂');
+Map.addLayer(riskLevelsNO2, visParams, 'Риск NO₂');
+Map.addLayer(classified, visParams, 'Суммарный риск загрязнения');
+
+
+// Определяем точки, в которых хотим получить значения суммарного риска (посты наземного наблюдения)
+var points = ee.FeatureCollection([
+  ee.Feature(ee.Geometry.Point([37.881841, 59.123391]), {name: "Пост № 1"}),
+  ee.Feature(ee.Geometry.Point([37.924568, 59.140085]), {name: "Пост № 2"}),
+  ee.Feature(ee.Geometry.Point([37.901204, 59.125132]), {name: "Пост № 3"}),
+  ee.Feature(ee.Geometry.Point([37.942247, 59.148046]), {name: "Пост № 4"}),
+  ee.Feature(ee.Geometry.Point([37.960128, 59.118592]), {name: "Пост № 5"}),
+  ee.Feature(ee.Geometry.Point([37.924348, 59.092129]), {name: "Пост № 6"})
+]);
+
+// Масштаб для reduceRegion (например, 1000 метров)
+var scale = 1000; 
+
+// Функция для извлечения спутниковой концентрации
+var getTotalHealthRisk = function(feature) {
+  var satTHR = totalRisk.reduceRegion({
+    reducer: ee.Reducer.first(),
+    geometry: feature.geometry(),
+    scale: scale
+  }).get('total_risk');
+  
+  return feature.set('total_risk', satTHR);
+};
+
+// Применение функции к каждой точке
+var riskData = points.map(getTotalHealthRisk);
+
+// Вывод результатов:
+print('Риск здоровью при хроническом ингаляционном\nвоздействии в точках по данным Sentinel-5P:');
+riskData.evaluate(function(features) {
+  features.features.forEach(function(feature) {
+    var value = feature.properties.total_risk;
+    print(feature.properties.name + ': ' + value);
+  });
+});
+
+
+var legend = ui.Panel({
+  style: {
+    position: 'bottom-right',
+    padding: '8px 15px'
+  }
+});
+
+var legendTitle = ui.Label({
+  value: 'Комбинированный уровень риска',
+  style: {
+    fontWeight: 'bold',
+    fontSize: '18px',
+    margin: '0 0 4px 0',
+    padding: '0'
+  }
+});
+
+legend.add(legendTitle);
+
+var levels = [
+  {color: 'green', label: 'Минимальный < 0.000001 (HI < 1)'},
+  {color: 'yellow', label: 'Допустимый 0.000011-0.00011 (1 <= HI < 3.0)'},
+  {color: 'orange', label: 'Настораживающий 0.00011-0.001 (3.0 <= HQI <= 6)'},
+  {color: 'red', label: 'Высокий > 0.001 (HQ > 6)'}
+];
+
+levels.forEach(function(level) {
+  var colorBox = ui.Label({
+    style: {
+      backgroundColor: level.color,
+      padding: '8px',
+      margin: '0 0 4px 0'
+    }
+  });
+
+  var description = ui.Label({
+    value: level.label,
+    style: {margin: '0 0 0 6px'}
+  });
+
+  legend.add(ui.Panel([colorBox, description], ui.Panel.Layout.Flow('horizontal')));
+});
+
+Map.add(legend);
+//====================
+
+// Добавление точек на карту
+Map.addLayer(points, {color: 'FF00CC'}, 'Посты наблюдения');
+
+
+// Добавление легенды шкала риска индивидуальных веществ
+var legend1 = ui.Panel({
+  style: {
+    position: 'bottom-left',
+    padding: '8px 15px'
+  }
+});
+
+var legendTitle1 = ui.Label({
+  value: 'Уровни риска индивидуальных веществ',
+  style: {
+    fontWeight: 'bold',
+    fontSize: '18px',
+    margin: '0 0 4px 0',
+    padding: '0'
+  }
+});
+
+legend1.add(legendTitle1);
+
+var levels = [
+  {color: 'green', label: 'Минимальный < 0.000001 (HQ < 0.1)'},
+  {color: 'yellow', label: 'Допустимый 0.000011-0.00011 (0.1 <= HQ < 1.1)'},
+  {color: 'orange', label: 'Настораживающий 0.00011-0.001 (1.1 <= HQ <= 3)'},
+  {color: 'red', label: 'Высокий > 0.001 (HQ > 3)'}
+];
+
+levels.forEach(function(level) {
+  var colorBox = ui.Label({
+    style: {
+      backgroundColor: level.color,
+      padding: '8px',
+      margin: '0 0 4px 0'
+    }
+  });
+
+  var description = ui.Label({
+    value: level.label,
+    style: {margin: '0 0 0 6px'}
+  });
+
+  legend1.add(ui.Panel([colorBox, description], ui.Panel.Layout.Flow('horizontal')));
+});
+
+Map.add(legend1);
+
